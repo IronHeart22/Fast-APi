@@ -8,7 +8,14 @@ import logging
 import os
 import json
 
+# -----------------------------
+# Config / Environment
+# -----------------------------
 PORT = int(os.environ.get("PORT", 8000))
+# Monthly interest rate (%). Default 1.5 if not provided via env.
+MONTHLY_INTEREST_RATE = float(os.environ.get("MONTHLY_INTEREST_RATE", 1.5))
+# Default number of columns for created worksheets (increased to allow new columns)
+DEFAULT_SHEET_COLS = int(os.environ.get("DEFAULT_SHEET_COLS", 15))
 
 # -----------------------------
 # Logging Setup
@@ -23,7 +30,7 @@ logger = logging.getLogger(__name__)
 # FastAPI App
 # -----------------------------
 app = FastAPI(
-    title="Statement of Accounts API", 
+    title="Statement of Accounts API",
     version="1.0.0",
     description="API for managing invoices and payments in Google Sheets"
 )
@@ -32,12 +39,13 @@ app = FastAPI(
 # Pydantic Models
 # -----------------------------
 class Invoice(BaseModel):
+    # Keep model keys as underscore style — but code accepts both underscore and space keys
     Date_Formatted: Optional[str] = None
     Reference_Number: Optional[str] = None
     Total_Formatted: Optional[str] = None
     Balance_Formatted: Optional[str] = None
     Status: Optional[str] = None
-    Age: Optional[int] = None
+    Age: Optional[int] = None  # days overdue
     Invoice_ID: Optional[str] = None
     Balance_Due: Optional[float] = None
 
@@ -56,22 +64,24 @@ class StatementData(BaseModel):
 # Google Sheets Configuration
 # -----------------------------
 SPREADSHEET_ID = "1-i1iJ_tPviu_KMtS06EtWVS1BBzbUuoEf0DtpkGtmrg"
-CREDENTIALS_FILE = "cred.json"  # Your credentials file
+CREDENTIALS_FILE = "cred.json"  # Primary credentials path
 
 # -----------------------------
 # Google Sheets Client
 # -----------------------------
 def get_google_sheets_client():
-    """Initialize Google Sheets client with service account credentials"""
+    """Initialize Google Sheets client with service account credentials.
+    Tries multiple common file paths to find the credential file.
+    Returns gspread client or None if not available.
+    """
     try:
         SCOPES = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
 
-        # List of possible credential file locations
         possible_paths = [
-            "cred.json",  # Your specific file
+            "cred.json",
             "./cred.json",
             "../cred.json",
             "service-account-credentials.json",
@@ -80,37 +90,25 @@ def get_google_sheets_client():
         ]
 
         logger.info("🔍 Searching for Google Sheets credentials...")
-        
-        # Try each possible path
         for credentials_path in possible_paths:
             if os.path.exists(credentials_path):
                 try:
                     logger.info(f"📄 Found credentials file at: {credentials_path}")
-                    
-                    # Load and validate the credentials
                     with open(credentials_path, 'r') as f:
                         cred_data = json.load(f)
-                        
-                    # Check if essential fields are present
+
                     required_fields = ['client_email', 'private_key', 'project_id']
                     missing_fields = [field for field in required_fields if not cred_data.get(field)]
-                    
                     if missing_fields:
-                        logger.error(f"❌ Credentials file is missing required fields: {missing_fields}")
+                        logger.error(f"❌ Credentials file missing fields: {missing_fields}")
                         continue
-                    
-                    # Create credentials
-                    creds = Credentials.from_service_account_file(
-                        credentials_path, 
-                        scopes=SCOPES
-                    )
-                    
-                    # Authorize and return client
+
+                    creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
                     client = gspread.authorize(creds)
-                    logger.info(f"✅ Successfully connected to Google Sheets!")
+                    logger.info("✅ Successfully connected to Google Sheets!")
                     logger.info(f"📧 Service Account: {cred_data.get('client_email')}")
                     return client
-                    
+
                 except json.JSONDecodeError:
                     logger.error(f"❌ Invalid JSON in credentials file: {credentials_path}")
                     continue
@@ -118,12 +116,8 @@ def get_google_sheets_client():
                     logger.error(f"❌ Error loading credentials from {credentials_path}: {str(e)}")
                     continue
 
-        # No valid credentials found
         logger.error("❌ No valid Google Sheets credentials found!")
-        logger.error("📝 Please ensure:")
-        logger.error("   1. Your 'cred.json' file is in the project directory")
-        logger.error("   2. The file contains valid service account credentials")
-        logger.error("   3. The Google Sheet is shared with the service account email")
+        logger.error("📝 Ensure cred.json exists, is valid, and the sheet is shared with the service account email")
         return None
 
     except Exception as e:
@@ -134,12 +128,11 @@ def get_google_sheets_client():
 # Helper Functions
 # -----------------------------
 def safe_float_conversion(value, default=0.0):
-    """Safely convert a value to float"""
+    """Safely convert a value to float (handles strings with currency and commas)."""
     if value is None:
         return default
     try:
         if isinstance(value, str):
-            # Remove currency symbols and formatting
             value = value.replace(',', '').replace('₹', '').replace('$', '').strip()
         return float(value)
     except (ValueError, TypeError):
@@ -148,7 +141,7 @@ def safe_float_conversion(value, default=0.0):
 
 
 def safe_int_conversion(value, default=0):
-    """Safely convert a value to int"""
+    """Safely convert to int (handles strings)."""
     if value is None:
         return default
     try:
@@ -160,22 +153,29 @@ def safe_int_conversion(value, default=0):
         return default
 
 
-def format_currency(amount):
-    """Format amount as currency"""
-    if amount is None:
-        return "₹0.00"
-    try:
-        amount = safe_float_conversion(amount, 0.0)
-        return f"₹{amount:,.2f}"
-    except Exception:
-        return "₹0.00"
+def get_invoice_field(inv: Dict[str, Any], *keys, default=None):
+    """Return the first existing key from keys in invoice dictionary.
+    Helps accept both 'Balance Due' and 'Balance_Due' style keys.
+    """
+    for k in keys:
+        if k in inv and inv[k] not in (None, ""):
+            return inv[k]
+    return default
 
-
-def prepare_sheet_data(invoices_data, payments_data):
-    """Prepare data for Google Sheets"""
-    
+# -----------------------------
+# Core: prepare_sheet_data
+# -----------------------------
+def prepare_sheet_data(invoices_data, payments_data, monthly_rate=MONTHLY_INTEREST_RATE):
+    """
+    Prepare rows for Google Sheets and compute interest & total balance.
+    - monthly_rate: percent per month (e.g., 1.5 for 1.5% per month)
+    - Interest is computed using monthly compounding:
+        interest = balance_due * ((1 + monthly_rate/100) ** (age_days/30) - 1)
+    - Age is clamped to >= 0 (negative ages treated as 0)
+    - Keeps raw float precision (no rounding / no currency formatting)
+    - Accepts invoice keys with spaces or underscores (e.g., 'Balance Due' or 'Balance_Due')
+    """
     try:
-        # Ensure we have lists
         if not isinstance(invoices_data, list):
             invoices_data = []
         if not isinstance(payments_data, list):
@@ -183,86 +183,105 @@ def prepare_sheet_data(invoices_data, payments_data):
 
         logger.info(f"📊 Processing {len(invoices_data)} invoices and {len(payments_data)} payments")
 
-        # Calculate totals with safe conversions
         total_balance_due = 0.0
+        total_interest = 0.0
+        total_total_balance = 0.0
+
+        # Payment totals (safe conversion)
+        total_paid_amount = sum(safe_float_conversion(get_invoice_field(p, "Paid Amount", "Paid_Amount", default=0)) for p in payments_data)
+        total_unused_amount = sum(safe_float_conversion(get_invoice_field(p, "Unused Amount", "Unused_Amount", default=0)) for p in payments_data)
+
+        # Status counting
+        status_counts: Dict[str, int] = {}
         for inv in invoices_data:
-            balance = safe_float_conversion(inv.get("Balance Due", 0))
-            total_balance_due += balance
+            st = str(get_invoice_field(inv, "Status", "Status", default="Unknown")).strip() or "Unknown"
+            status_counts[st] = status_counts.get(st, 0) + 1
 
-        total_paid_amount = 0.0
-        for pay in payments_data:
-            paid = safe_float_conversion(pay.get("Paid Amount", 0))
-            total_paid_amount += paid
-
-        total_unused_amount = 0.0
-        for pay in payments_data:
-            unused = safe_float_conversion(pay.get("Unused Amount", 0))
-            total_unused_amount += unused
-
-        net_outstanding = total_balance_due - (total_paid_amount - total_unused_amount)
-
-        # Count invoice statuses
-        status_counts = {}
-        for invoice in invoices_data:
-            status = str(invoice.get("Status", "Unknown")).strip() or "Unknown"
-            status_counts[status] = status_counts.get(status, 0) + 1
-
-        # Build the sheet rows
-        rows = []
+        rows: List[List[Any]] = []
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Header section
+
+        # Header (human readable)
         rows.extend([
             ["STATEMENT OF ACCOUNTS"],
             [f"Generated on: {current_time}"],
+            [f"Interest rate (per month): {monthly_rate}%"],  # show applied monthly rate
             [""],
             ["=" * 80],
             [""],
         ])
 
-        # Invoices section
+        # Invoices Section — we've placed Interest & Total Balance after Balance (as requested)
         rows.extend([
             ["INVOICES SECTION"],
-            ["Date", "Reference", "Total", "Balance", "Status", "Age", "Invoice ID", "Balance Due"],
+            ["Date", "Reference", "Total", "Balance", "Interest", "Total Balance", "Status", "Age", "Invoice ID", "Balance Due"],
         ])
 
-        for invoice in invoices_data:
+        for inv in invoices_data:
+            # Normalize fields: accept both "Balance Due" and "Balance_Due", etc.
+            balance_due = safe_float_conversion(get_invoice_field(inv, "Balance Due", "Balance_Due", default=0))
+            age_days = safe_int_conversion(get_invoice_field(inv, "Age", "Age", default=0))
+            # Clamp negative ages to 0 to avoid negative compounding
+            age_days = max(age_days, 0)
+
+            total_balance_due += balance_due
+
+            # Monthly compound interest computation
+            months = age_days / 30.0
+            try:
+                interest_val = balance_due * ((1 + (monthly_rate / 100.0)) ** months - 1.0)
+            except Exception as e:
+                logger.warning(f"Could not compute interest for invoice {get_invoice_field(inv, 'Invoice ID', 'Invoice_ID', default='?')}: {e}")
+                interest_val = 0.0
+
+            total_balance = balance_due + interest_val
+
+            # Accumulate summary totals
+            total_interest += interest_val
+            total_total_balance += total_balance
+
+            # Append invoice row: raw floats for interest and total_balance (no rounding/formatting)
             rows.append([
-                str(invoice.get("Date Formatted", "")),
-                str(invoice.get("Reference Number", "")),
-                str(invoice.get("Total Formatted", "")),
-                str(invoice.get("Balance Formatted", "")),
-                str(invoice.get("Status", "")),
-                str(invoice.get("Age", "")),
-                str(invoice.get("Invoice ID", "")),
-                safe_float_conversion(invoice.get("Balance Due", 0)),
+                str(get_invoice_field(inv, "Date Formatted", "Date_Formatted", default="")),
+                str(get_invoice_field(inv, "Reference Number", "Reference_Number", default="")),
+                str(get_invoice_field(inv, "Total Formatted", "Total_Formatted", default="")),
+                str(get_invoice_field(inv, "Balance Formatted", "Balance_Formatted", default="")),
+                interest_val,              # raw float
+                total_balance,             # raw float
+                str(get_invoice_field(inv, "Status", "Status", default="")),
+                str(age_days),
+                str(get_invoice_field(inv, "Invoice ID", "Invoice_ID", default="")),
+                balance_due,
             ])
 
+        # Separator rows
         rows.extend([[""], ["=" * 80], [""]])
 
-        # Payments section
+        # Payments Section (unchanged format, safe numeric conversion)
         rows.extend([
             ["PAYMENTS SECTION"],
             ["Payment ID", "Paid Amount", "Unused Amount"],
         ])
 
-        for payment in payments_data:
+        for pay in payments_data:
             rows.append([
-                str(payment.get("Payment ID", "")),
-                safe_float_conversion(payment.get("Paid Amount", 0)),
-                safe_float_conversion(payment.get("Unused Amount", 0)),
+                str(get_invoice_field(pay, "Payment ID", "Payment_ID", default="")),
+                safe_float_conversion(get_invoice_field(pay, "Paid Amount", "Paid_Amount", default=0)),
+                safe_float_conversion(get_invoice_field(pay, "Unused Amount", "Unused_Amount", default=0)),
             ])
 
         rows.extend([[""], ["=" * 80], [""]])
 
-        # Financial Summary
+        # Financial Summary — raw floats for numeric values, includes interest totals and applied rate line above
+        net_outstanding = total_balance_due - (total_paid_amount - total_unused_amount)
         rows.extend([
             ["FINANCIAL SUMMARY"],
             [""],
-            ["Total Balance Due:", format_currency(total_balance_due)],
-            ["Total Paid Amount:", format_currency(total_paid_amount)],
-            ["Total Unused Amount:", format_currency(total_unused_amount)],
-            ["Net Outstanding:", format_currency(net_outstanding)],
+            ["Total Balance Due:", total_balance_due],
+            ["Total Interest:", total_interest],
+            ["Total (Balance + Interest):", total_total_balance],
+            ["Total Paid Amount:", total_paid_amount],
+            ["Total Unused Amount:", total_unused_amount],
+            ["Net Outstanding (Balance - Paid + Unused):", net_outstanding],
             [""],
             ["INVOICE STATUS BREAKDOWN:"],
         ])
@@ -281,6 +300,8 @@ def prepare_sheet_data(invoices_data, payments_data):
 
         summary = {
             "total_balance_due": total_balance_due,
+            "total_interest": total_interest,
+            "total_balance_plus_interest": total_total_balance,
             "total_paid_amount": total_paid_amount,
             "total_unused_amount": total_unused_amount,
             "net_outstanding": net_outstanding,
@@ -290,68 +311,62 @@ def prepare_sheet_data(invoices_data, payments_data):
             "rows_written": len(rows),
         }
 
-        logger.info(f"✅ Data preparation complete: {len(rows)} rows prepared")
+        logger.info(f"✅ Data preparation complete with interest: {len(rows)} rows prepared")
         return rows, summary
 
     except Exception as e:
         logger.error(f"❌ Error preparing sheet data: {str(e)}")
-        # Return minimal valid data on error
         return [], {
+            "error": str(e),
             "total_balance_due": 0,
+            "total_interest": 0,
+            "total_balance_plus_interest": 0,
             "total_paid_amount": 0,
             "total_unused_amount": 0,
             "net_outstanding": 0,
             "status_counts": {},
-            "invoices_count": 0,
-            "payments_count": 0,
-            "rows_written": 0,
-            "error": str(e)
         }
 
-
+# -----------------------------
+# Write to Google Sheets
+# -----------------------------
 def write_to_google_sheets(client, rows):
-    """Write data to Google Sheets"""
+    """Write data to Google Sheets using batch updates. Creates a new worksheet for each statement."""
     try:
-        # Open the spreadsheet
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        
-        # Create a new worksheet with timestamp
+
+        # Worksheet name with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         worksheet_name = f"Statement_{timestamp}"
-        
         logger.info(f"📝 Creating new worksheet: {worksheet_name}")
-        
-        # Add new worksheet
+
+        # Create worksheet with default columns increased to DEFAULT_SHEET_COLS
         worksheet = spreadsheet.add_worksheet(
             title=worksheet_name,
             rows=max(len(rows) + 20, 100),
-            cols=12
+            cols=DEFAULT_SHEET_COLS
         )
-        
-        # Write data in batches for better performance
+
+        # Batch write in chunks for performance
         if rows:
             batch_size = 100
             total_batches = (len(rows) + batch_size - 1) // batch_size
-            
             for i in range(0, len(rows), batch_size):
                 batch = rows[i:i + batch_size]
                 start_row = i + 1
                 batch_num = (i // batch_size) + 1
-                
                 logger.info(f"📤 Writing batch {batch_num}/{total_batches} (rows {start_row}-{start_row + len(batch) - 1})")
                 worksheet.update(f"A{start_row}", batch)
-            
             logger.info(f"✅ Successfully wrote {len(rows)} rows to Google Sheets")
-        
+
         return {
             "worksheet_name": worksheet_name,
             "worksheet_id": worksheet.id,
             "spreadsheet_url": f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={worksheet.id}"
         }
-        
+
     except gspread.SpreadsheetNotFound:
         logger.error(f"❌ Spreadsheet not found: {SPREADSHEET_ID}")
-        logger.error("   Please check the spreadsheet ID and ensure it's shared with the service account")
         raise HTTPException(status_code=404, detail="Spreadsheet not found or not accessible")
     except gspread.APIError as e:
         logger.error(f"❌ Google Sheets API error: {str(e)}")
@@ -392,11 +407,9 @@ async def health_check():
 
 @app.get("/check_credentials")
 async def check_credentials():
-    """Check if Google Sheets credentials are properly configured"""
+    """Check if Google Sheets credentials are properly configured (and spreadsheet accessible)."""
     logger.info("🔍 Checking Google Sheets credentials...")
-    
     client = get_google_sheets_client()
-    
     if client is None:
         return {
             "status": "error",
@@ -404,23 +417,20 @@ async def check_credentials():
             "instructions": [
                 "1. Ensure 'cred.json' is in your project directory",
                 "2. Verify the file contains valid service account credentials",
-                "3. Check that all required fields are present and not empty",
-                "4. Share your Google Sheet with the service account email"
+                "3. Share the Google Sheet with the service account email"
             ],
             "spreadsheet_id": SPREADSHEET_ID
         }
-    
+
     try:
-        # Try to access the spreadsheet
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        
-        # Get service account email from credentials
+
         service_account_email = "Unknown"
         if os.path.exists(CREDENTIALS_FILE):
             with open(CREDENTIALS_FILE, 'r') as f:
                 cred_data = json.load(f)
                 service_account_email = cred_data.get('client_email', 'Unknown')
-        
+
         return {
             "status": "success",
             "message": "✅ Credentials are valid and spreadsheet is accessible",
@@ -436,7 +446,7 @@ async def check_credentials():
             "message": "Credentials are valid but spreadsheet not found or not shared",
             "instructions": [
                 f"1. Open the spreadsheet: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit",
-                "2. Click the 'Share' button",
+                "2. Click 'Share'",
                 "3. Add the service account email from your cred.json file",
                 "4. Give it 'Editor' permissions",
                 "5. Click 'Send'"
@@ -452,8 +462,7 @@ async def check_credentials():
 
 @app.post("/write_statement/")
 async def create_statement(data: StatementData):
-    """Create a new Statement of Accounts in Google Sheets"""
-    
+    """Create a new Statement of Accounts in Google Sheets."""
     try:
         logger.info("=" * 60)
         logger.info("📥 NEW STATEMENT REQUEST RECEIVED")
@@ -461,17 +470,15 @@ async def create_statement(data: StatementData):
         logger.info(f"💳 Payments: {len(data.payments)}")
         logger.info("=" * 60)
 
-        # Prepare the data
+        # Prepare the data (uses env MONTHLY_INTEREST_RATE by default)
         rows, summary = prepare_sheet_data(data.invoices, data.payments)
-        
+
         if "error" in summary:
             logger.warning(f"⚠️ Data preparation warning: {summary.get('error')}")
 
-        # Get Google Sheets client
         client = get_google_sheets_client()
-        
         if client is None:
-            # Simulated mode when no credentials
+            # Simulated mode: return preview and summary without writing to Google Sheets
             logger.warning("⚠️ Running in SIMULATED MODE - No Google credentials")
             return {
                 "status": "simulated_success",
@@ -488,11 +495,11 @@ async def create_statement(data: StatementData):
         # Write to Google Sheets
         logger.info("📤 Writing to Google Sheets...")
         sheet_result = write_to_google_sheets(client, rows)
-        
+
         logger.info("✅ STATEMENT CREATED SUCCESSFULLY!")
         logger.info(f"📊 Worksheet: {sheet_result['worksheet_name']}")
         logger.info(f"🔗 URL: {sheet_result['spreadsheet_url']}")
-        
+
         return {
             "status": "success",
             "message": "Statement created successfully in Google Sheets",
@@ -504,7 +511,7 @@ async def create_statement(data: StatementData):
         }
 
     except HTTPException:
-        raise  # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"❌ Unexpected error creating statement: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -512,11 +519,14 @@ async def create_statement(data: StatementData):
 
 @app.post("/append_to_statement/")
 async def append_to_statement(data: StatementData):
-    """Append data to existing statement (demo implementation)"""
+    """Append data to existing statement (demo implementation).
+    Current implementation prepares rows and returns the summary.
+    To fully implement: accept worksheet_name and append there.
+    """
     try:
         logger.info("📥 Append request received")
         rows, summary = prepare_sheet_data(data.invoices, data.payments)
-        
+
         return {
             "status": "success",
             "message": "Data prepared for appending (feature not fully implemented)",
@@ -532,25 +542,21 @@ async def append_to_statement(data: StatementData):
 
 @app.get("/get_statement/")
 async def get_statement(worksheet_name: Optional[str] = None):
-    """Retrieve statement data from Google Sheets"""
+    """Retrieve statement data from Google Sheets. If worksheet_name is omitted, returns available sheets."""
     try:
         client = get_google_sheets_client()
-        
         if client is None:
             return {
                 "status": "error",
                 "message": "Google Sheets credentials not configured",
                 "data": None
             }
-        
+
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        
-        # Get list of all worksheets
         worksheets = spreadsheet.worksheets()
         worksheet_list = [ws.title for ws in worksheets]
-        
+
         if worksheet_name:
-            # Get specific worksheet
             try:
                 worksheet = spreadsheet.worksheet(worksheet_name)
                 data = worksheet.get_all_values()
@@ -558,7 +564,7 @@ async def get_statement(worksheet_name: Optional[str] = None):
                     "status": "success",
                     "worksheet": worksheet_name,
                     "rows": len(data),
-                    "data": data[:50],  # Return first 50 rows
+                    "data": data[:50],
                     "message": "Data retrieved successfully"
                 }
             except gspread.WorksheetNotFound:
@@ -568,7 +574,6 @@ async def get_statement(worksheet_name: Optional[str] = None):
                     "available_worksheets": worksheet_list
                 }
         else:
-            # Return list of available worksheets
             return {
                 "status": "success",
                 "message": "Available worksheets",
@@ -576,33 +581,32 @@ async def get_statement(worksheet_name: Optional[str] = None):
                 "count": len(worksheet_list),
                 "instruction": "Add ?worksheet_name=<name> to get specific worksheet data"
             }
-            
+
     except Exception as e:
         logger.error(f"❌ Error retrieving statement: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # -----------------------------
 # Run the application
 # -----------------------------
 if __name__ == "__main__":
     import uvicorn
-    
+
     logger.info("🚀 Starting Statement of Accounts API...")
     logger.info(f"📊 Target Spreadsheet ID: {SPREADSHEET_ID}")
     logger.info(f"📄 Looking for credentials file: {CREDENTIALS_FILE}")
-    
-    # Check credentials on startup
+    logger.info(f"🔢 Default monthly interest rate: {MONTHLY_INTEREST_RATE}% per month")
+    logger.info(f"🔢 Default sheet columns: {DEFAULT_SHEET_COLS}")
+
     client = get_google_sheets_client()
     if client:
         logger.info("✅ Google Sheets connection established!")
     else:
         logger.warning("⚠️ Running without Google Sheets connection (simulated mode)")
-    
-    # Run the server
+
     uvicorn.run(
-        app, 
-        host="127.0.0.1", 
-        port=8000,
+        app,
+        host="127.0.0.1",
+        port=PORT,
         log_level="info"
     )
